@@ -4,7 +4,17 @@ Custom firmware for the **GeekMagic SmallTV / SmallTV-Ultra** (ESP-12F, 1.54" 24
 
 Also builds for the ESP32-C2 knockoff (`smalltv_c2`) and SmallTV Pro (`smalltv_pro`).
 
-Open this repo in **PlatformIO IDE** (VS Code / Cursor) or the Arduino IDE with the ESP8266 core. The Ultra is an ESP-12F, not an ESP32 — only the Pro / C2 boards are ESP32.
+The Ultra is an ESP-12F, not an ESP32 — only the Pro / C2 boards are ESP32.
+
+## Arduino IDE
+
+Open this file, not the repo root:
+
+`SmallTV_Unraid/SmallTV_Unraid.ino`
+
+Board: **Generic ESP8266 Module**. Crystal **26 MHz**, CPU **80 MHz**, flash frequency **40 MHz**, flash size **4MB (FS:2MB OTA:~1019KB)**.
+
+Libraries: TFT_eSPI (Bodmer), ArduinoJson 7.x (Benoit Blanchon), WiFiManager (tzapu). Point TFT_eSPI at `User_Setups/Setup_SmallTV_Ultra.h` from `User_Setup_Select.h` — do not replace the whole `User_Setup.h`.
 
 ## What it shows
 
