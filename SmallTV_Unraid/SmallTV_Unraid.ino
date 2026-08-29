@@ -208,7 +208,10 @@ static void drawDashboard() {
   tft.setTextColor(COL_ORANGE, COL_PANEL);
   tft.drawString("UNRAID", 8, 4, 2);
   tft.setTextColor(COL_TEXT, COL_PANEL);
-  tft.drawString(st.hostname, 8, 20, 1);
+  if (WiFi.isConnected())
+    tft.drawString(WiFi.localIP().toString(), 8, 20, 1);
+  else
+    tft.drawString(st.hostname, 8, 20, 1);
 
   tft.setTextDatum(TR_DATUM);
   tft.setTextColor(st.lastOk ? COL_GREEN : COL_RED, COL_PANEL);
@@ -484,37 +487,46 @@ static void pollVms() {
 }
 
 // ---- config web UI --------------------------------------------------------
+static bool wantPortal = false;
+
 static const char PAGE[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
-<title>SmallTV UnraidClaw</title>
+<title>SmallTV Settings</title>
 <style>
-body{font-family:sans-serif;background:#111318;color:#eee;margin:20px}
+body{font-family:sans-serif;background:#111318;color:#eee;margin:20px;max-width:420px}
+h2{color:#ff8c2f}
 label{display:block;margin-top:12px;color:#aaa;font-size:13px}
 input,select{width:100%;padding:8px;border-radius:6px;border:1px solid #333;background:#1b1e26;color:#fff;box-sizing:border-box}
-button{margin-top:16px;padding:10px 16px;background:#ff8c2f;border:0;border-radius:6px;font-weight:700}
+button{margin-top:16px;margin-right:8px;padding:10px 16px;background:#ff8c2f;border:0;border-radius:6px;font-weight:700;color:#111}
+button.secondary{background:#333;color:#eee}
 .note{color:#888;font-size:12px;margin-top:8px}
+.status{background:#1b1e26;padding:10px;border-radius:6px;font-size:13px}
 </style></head><body>
-<h2>SmallTV &rarr; UnraidClaw</h2>
+<h2>Settings</h2>
+<p class=status>Device IP %IP%<br>Unraid target: %HOSTSHOW%<br>Last poll: %STATUS%</p>
 <form method=POST action=/save>
-<label>Unraid IP / hostname</label>
-<input name=host value="%HOST%" placeholder="192.168.1.10">
-<label>Port</label>
+<label>Unraid IP or hostname</label>
+<input name=host value="%HOST%" placeholder="192.168.1.10" autocomplete="off">
+<label>UnraidClaw port</label>
 <input name=port type=number value="%PORT%">
 <label>Use HTTPS</label>
-<select name=https><option value=1 %H1%>yes (default)</option><option value=0 %H0%>no</option></select>
+<select name=https><option value=1 %H1%>yes (UnraidClaw default)</option><option value=0 %H0%>no</option></select>
 <label>Skip TLS verify (self-signed cert)</label>
 <select name=insecure><option value=1 %I1%>yes (needed for UnraidClaw)</option><option value=0 %I0%>no</option></select>
 <label>UnraidClaw API key</label>
-<input name=key value="%KEY%" placeholder="paste key from Settings &gt; UnraidClaw">
+<input name=key value="%KEY%" placeholder="paste key from UnraidClaw Settings" autocomplete="off">
 <label>Poll interval (ms)</label>
 <input name=poll type=number value="%POLL%">
 <label>Brightness 0-255</label>
 <input name=bri type=number value="%BRI%">
 <label>Backlight inverted</label>
 <select name=invbl><option value=1 %B1%>yes (SmallTV default)</option><option value=0 %B0%>no</option></select>
-<button>Save</button>
+<button type=submit>Save</button>
 </form>
-<p class=note>Firmware %FW% &middot; grant the key <code>info:read</code>, <code>array:read</code>, <code>docker:read</code>, <code>vms:read</code>. UnraidClaw does not currently expose GPU utilisation — CPU load averages and memory are shown instead.</p>
+<form method=POST action=/portal>
+<button class=secondary type=submit>Change Wi-Fi</button>
+</form>
+<p class=note>Nothing is hard-coded. Host and API key live in flash on this device. Firmware %FW%. Key needs <code>info:read</code>, <code>array:read</code>, <code>docker:read</code>, <code>vms:read</code>.</p>
 </body></html>
 )HTML";
 
@@ -528,6 +540,9 @@ static String htmlEscape(const String &s) {
 
 static void handleRoot() {
   String page = FPSTR(PAGE);
+  page.replace("%IP%", WiFi.localIP().toString());
+  page.replace("%HOSTSHOW%", cfg.host[0] ? htmlEscape(cfg.host) : String("(not set)"));
+  page.replace("%STATUS%", st.lastOk ? String("ok") : htmlEscape(st.lastError));
   page.replace("%HOST%", htmlEscape(cfg.host));
   page.replace("%PORT%", String(cfg.port));
   page.replace("%H1%", cfg.useHttps ? "selected" : "");
@@ -567,6 +582,13 @@ static void handleSave() {
 static void startWeb() {
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/portal", HTTP_POST, []() {
+    wantPortal = true;
+    server.send(200, "text/html",
+                "<body style='background:#111;color:#eee;font-family:sans-serif'>"
+                "Starting setup AP <b>SmallTV-Unraid</b>. Join it to change Wi-Fi "
+                "and Unraid settings.</body>");
+  });
   server.on("/status", []() {
     JsonDocument doc;
     doc["ok"] = st.lastOk;
@@ -580,6 +602,46 @@ static void startWeb() {
     server.send(200, "application/json", out);
   });
   server.begin();
+}
+
+static void applyPortalParams(WiFiManagerParameter &p_host,
+                              WiFiManagerParameter &p_port,
+                              WiFiManagerParameter &p_key,
+                              WiFiManagerParameter &p_https) {
+  const char *h = p_host.getValue();
+  if (h && h[0]) strlcpy(cfg.host, h, MAX_HOST_LEN);
+  int port = atoi(p_port.getValue());
+  if (port > 0) cfg.port = (uint16_t)port;
+  const char *k = p_key.getValue();
+  if (k && k[0]) strlcpy(cfg.apiKey, k, MAX_KEY_LEN);
+  const char *hs = p_https.getValue();
+  if (hs && hs[0]) cfg.useHttps = (hs[0] != '0');
+  saveSettings();
+}
+
+static void runWifiPortal(bool force) {
+  char portBuf[8];
+  char httpsBuf[4];
+  snprintf(portBuf, sizeof(portBuf), "%u", cfg.port);
+  snprintf(httpsBuf, sizeof(httpsBuf), "%u", cfg.useHttps ? 1 : 0);
+
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(180);
+  wm.setHostname("smalltv-unraid");
+  wm.setTitle("SmallTV Unraid");
+
+  WiFiManagerParameter p_host("uhost", "Unraid IP or hostname", cfg.host, MAX_HOST_LEN - 1);
+  WiFiManagerParameter p_port("uport", "UnraidClaw port", portBuf, 7);
+  WiFiManagerParameter p_https("uhttps", "HTTPS 1=yes 0=no", httpsBuf, 3);
+  WiFiManagerParameter p_key("ukey", "UnraidClaw API key", cfg.apiKey, MAX_KEY_LEN - 1);
+  wm.addParameter(&p_host);
+  wm.addParameter(&p_port);
+  wm.addParameter(&p_https);
+  wm.addParameter(&p_key);
+
+  splash("WiFi setup", "join SmallTV-Unraid");
+  bool ok = force ? wm.startConfigPortal(AP_SSID) : wm.autoConnect(AP_SSID);
+  if (ok) applyPortalParams(p_host, p_port, p_key, p_https);
 }
 
 void setup() {
@@ -597,19 +659,10 @@ void setup() {
   loadSettings();
   setBacklight(cfg.brightness);
 
-  splash("connecting WiFi");
-
   WiFi.mode(WIFI_STA);
-  WiFiManager wm;
-  wm.setConfigPortalTimeout(180);
-  wm.setHostname("smalltv-unraid");
-  bool connected = wm.autoConnect(AP_SSID);
-  if (!connected) {
-    splash("WiFi setup", "join SmallTV-Unraid");
-    // stay in portal until reboot — autoConnect already blocked
-  }
+  runWifiPortal(false);
 
-  splash(WiFi.localIP().toString().c_str(), "open this IP in a browser");
+  splash(WiFi.localIP().toString().c_str(), "open IP for Settings");
   MDNS.begin("smalltv-unraid");
   startWeb();
 
@@ -630,6 +683,13 @@ void loop() {
 #ifdef ESP8266
   MDNS.update();
 #endif
+
+  if (wantPortal) {
+    wantPortal = false;
+    runWifiPortal(true);
+    splash(WiFi.localIP().toString().c_str(), "open IP for Settings");
+    drawDashboard();
+  }
 
   uint32_t now = millis();
   if (cfg.host[0] && cfg.apiKey[0] && now - lastFastPoll >= cfg.pollMs) {
