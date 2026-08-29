@@ -58,13 +58,14 @@ esptool.py --chip esp8266 --port /dev/ttyUSB0 write_flash 0x0 \
   .pio/build/smalltv_ultra/firmware.bin
 ```
 
-## First boot
+## First boot / Settings
+
+Nothing is hard-coded. Unraid address and API key are entered on the device and stored in flash.
 
 1. Join the open AP **SmallTV-Unraid**.
-2. Captive portal asks for your 2.4 GHz Wi-Fi.
-3. After join, the screen shows the device IP. Browse to it.
-4. Enter Unraid IP, port `9876`, HTTPS on, skip-TLS-verify on, and the UnraidClaw API key from **Settings → UnraidClaw**.
-5. Save. The cube starts polling.
+2. The portal asks for 2.4 GHz Wi-Fi **and** Unraid IP, port, HTTPS, and API key.
+3. After join, the screen shows the device IP. Open that IP in a browser for the **Settings** page.
+4. Change host / key / brightness there any time. **Change Wi-Fi** reopens the setup AP.
 
 UnraidClaw speaks **HTTPS with a self-signed cert** on port **9876**. Leave skip-TLS-verify on or the ESP8266 handshake fails.
 
