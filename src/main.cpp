@@ -19,6 +19,7 @@
   #include <HTTPClient.h>
   #include <WebServer.h>
   #include <ESPmDNS.h>
+  #include <Update.h>
   using HttpServer = WebServer;
 #else
   #include <ESP8266WiFi.h>
@@ -26,6 +27,7 @@
   #include <ESP8266HTTPClient.h>
   #include <ESP8266WebServer.h>
   #include <ESP8266mDNS.h>
+  #include <Updater.h>
   using HttpServer = ESP8266WebServer;
 #endif
 
@@ -106,7 +108,7 @@ static uint32_t histGap(uint32_t age) {
 
 static void histCompact() {
   uint32_t now = nowSec();
-  HistSample out[HIST_MAX];
+  static HistSample out[HIST_MAX];
   uint16_t n = 0;
   for (uint16_t i = 0; i < histCount; i++) {
     uint32_t age = now - hist[i].sec;
@@ -208,9 +210,10 @@ static void defaults() {
 
 static void loadSettings() {
   defaults();
+  // Do not format on failure — format takes longer than the WDT and boot-loops.
   if (!LittleFS.begin()) {
-    LittleFS.format();
-    LittleFS.begin();
+    Serial.println(F("LittleFS mount failed"));
+    return;
   }
   File f = LittleFS.open(SETTINGS_PATH, "r");
   if (!f) return;
@@ -283,7 +286,7 @@ static void splash(const char *line1, const char *line2 = "") {
   tft.fillScreen(COL_BG);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(COL_ORANGE, COL_BG);
-  tft.drawString("UNRAID", 120, 90, 4);
+  tft.drawString("UNRAID", 120, 90, 2);
   tft.setTextColor(COL_TEXT, COL_BG);
   tft.drawString(line1, 120, 130, 2);
   if (line2[0]) {
@@ -596,6 +599,7 @@ button.secondary{background:#333;color:#eee}
 <form method=POST action=/portal>
 <button class=secondary type=submit>Change Wi-Fi</button>
 </form>
+<p><a href="/update" style="color:#ff8c2f">Firmware update</a></p>
 <p class=note>Nothing is hard-coded. Host and API key live in flash on this device. Firmware %FW%. Key needs <code>info:read</code>, <code>array:read</code>, <code>docker:read</code>, <code>vms:read</code>.</p>
 </body></html>
 )HTML";
@@ -649,9 +653,74 @@ static void handleSave() {
               "Saved. Polling UnraidClaw&hellip;</body>");
 }
 
+static const char UPDATE_PAGE[] PROGMEM = R"HTML(
+<!DOCTYPE html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Firmware update</title>
+<style>
+body{font-family:sans-serif;background:#111318;color:#eee;margin:20px;max-width:420px}
+h2{color:#ff8c2f}
+input,button{margin-top:12px}
+button{padding:10px 16px;background:#ff8c2f;border:0;border-radius:6px;font-weight:700;color:#111}
+.note{color:#888;font-size:12px}
+a{color:#ff8c2f}
+</style></head><body>
+<h2>Firmware update</h2>
+<p>Current version %FW%</p>
+<p class=note>Use Sketch &rarr; Export Compiled Binary in Arduino IDE. Upload the <code>.bin</code> only (not .elf / .partitions).</p>
+<form method=POST action=/update enctype=multipart/form-data>
+<input type=file name=firmware accept=.bin>
+<button type=submit>Upload and reboot</button>
+</form>
+<p><a href="/">Back to Settings</a></p>
+</body></html>
+)HTML";
+
+static void handleUpdatePage() {
+  String page = FPSTR(UPDATE_PAGE);
+  page.replace("%FW%", FW_VERSION);
+  server.send(200, "text/html", page);
+}
+
+static void handleUpdateDone() {
+  const bool ok = !Update.hasError();
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/html",
+              ok
+                ? "<body style='background:#111;color:#eee;font-family:sans-serif'>"
+                  "Update OK. Rebooting&hellip;</body>"
+                : "<body style='background:#111;color:#eee;font-family:sans-serif'>"
+                  "Update failed. Power-cycle and try a smaller .bin.</body>");
+  if (ok) {
+    delay(800);
+    ESP.restart();
+  }
+}
+
+static void handleUpdateUpload() {
+  HTTPUpload &upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    splash("updating", upload.filename.c_str());
+    Serial.printf("OTA start: %s\n", upload.filename.c_str());
+#ifdef ESP32
+    uint32_t maxSketch = UPDATE_SIZE_UNKNOWN;
+#else
+    uint32_t maxSketch = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+#endif
+    if (!Update.begin(maxSketch)) Update.printError(Serial);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
+      Update.printError(Serial);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) Serial.printf("OTA success %u bytes\n", upload.totalSize);
+    else Update.printError(Serial);
+  }
+}
+
 static void startWeb() {
   server.on("/", handleRoot);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.on("/portal", HTTP_POST, []() {
     wantPortal = true;
     server.send(200, "text/html",
@@ -695,10 +764,17 @@ static void runWifiPortal(bool force) {
   snprintf(portBuf, sizeof(portBuf), "%u", cfg.port);
   snprintf(httpsBuf, sizeof(httpsBuf), "%u", cfg.useHttps ? 1 : 0);
 
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.persistent(true);
+  delay(200);
+  ESP.wdtFeed();
+
   WiFiManager wm;
-  wm.setConfigPortalTimeout(180);
+  wm.setDebugOutput(true);
+  wm.setConfigPortalTimeout(0);   // stay up until saved — timeout was rebooting people
+  wm.setConnectTimeout(20);
   wm.setHostname("smalltv-unraid");
-  wm.setTitle("SmallTV Unraid");
+  wm.setHttpPort(80);
 
   WiFiManagerParameter p_host("uhost", "Unraid IP or hostname", cfg.host, MAX_HOST_LEN - 1);
   WiFiManagerParameter p_port("uport", "UnraidClaw port", portBuf, 7);
@@ -710,6 +786,7 @@ static void runWifiPortal(bool force) {
   wm.addParameter(&p_key);
 
   splash("WiFi setup", "join SmallTV-Unraid");
+  ESP.wdtFeed();
   bool ok = force ? wm.startConfigPortal(AP_SSID) : wm.autoConnect(AP_SSID);
   if (ok) applyPortalParams(p_host, p_port, p_key, p_https);
 }

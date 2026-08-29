@@ -1,7 +1,7 @@
 #pragma once
 
 #define FW_NAME    "smalltv-unraidclaw"
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
 
 #define AP_SSID    "SmallTV-Unraid"
 #define AP_PASS    ""
