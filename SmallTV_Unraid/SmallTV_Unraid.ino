@@ -7,6 +7,7 @@
 // array, docker and VM counts on the 240x240 ST7789.
 
 #include <Arduino.h>
+#include <string.h>
 #include <TFT_eSPI.h>
 #include <ArduinoJson.h>
 #include <WiFiManager.h>
@@ -73,6 +74,99 @@ struct Stats {
   int vmsRunning = -1;
   int vmsTotal = -1;
 } st;
+
+struct HistSample {
+  uint32_t sec;
+  uint16_t loadx100;
+  uint8_t mem;
+  uint8_t arr;
+};
+
+static HistSample hist[HIST_MAX];
+static uint16_t histCount = 0;
+
+static uint32_t nowSec() { return millis() / 1000UL; }
+
+static uint32_t histGap(uint32_t age) {
+  if (age < HIST_RECENT_S) return 5;
+  if (age < HIST_MID_S) return 60;
+  return 180;
+}
+
+static void histCompact() {
+  uint32_t now = nowSec();
+  HistSample out[HIST_MAX];
+  uint16_t n = 0;
+  for (uint16_t i = 0; i < histCount; i++) {
+    uint32_t age = now - hist[i].sec;
+    if (age > HIST_WINDOW_S) continue;
+    if (n == 0) {
+      out[n++] = hist[i];
+      continue;
+    }
+    uint32_t dt = hist[i].sec - out[n - 1].sec;
+    if (dt < histGap(age)) {
+      out[n - 1].loadx100 = (uint16_t)((out[n - 1].loadx100 + hist[i].loadx100) / 2);
+      out[n - 1].mem = (uint8_t)((out[n - 1].mem + hist[i].mem) / 2);
+      out[n - 1].arr = (uint8_t)((out[n - 1].arr + hist[i].arr) / 2);
+      out[n - 1].sec = hist[i].sec;
+    } else if (n < HIST_MAX) {
+      out[n++] = hist[i];
+    }
+  }
+  memcpy(hist, out, n * sizeof(HistSample));
+  histCount = n;
+}
+
+static void histPush() {
+  if (!st.haveMetrics) return;
+  uint32_t t = nowSec();
+  if (histCount > 0 && t - hist[histCount - 1].sec < 4) return;
+
+  float cpuPct = 0;
+  if (st.threads > 0) cpuPct = (st.load1 / (float)st.threads) * 100.0f;
+  else cpuPct = st.load1 * 25.0f;
+  if (cpuPct < 0) cpuPct = 0;
+  if (cpuPct > 250) cpuPct = 250;
+
+  HistSample s;
+  s.sec = t;
+  s.loadx100 = (uint16_t)(cpuPct * 100.0f + 0.5f);
+  s.mem = (uint8_t)constrain((int)(st.memUsedPct + 0.5f), 0, 100);
+  float ap = st.arrayUsedPct;
+  s.arr = (ap < 0) ? 255 : (uint8_t)constrain((int)(ap + 0.5f), 0, 100);
+
+  if (histCount < HIST_MAX) hist[histCount++] = s;
+  else {
+    memmove(&hist[0], &hist[1], (HIST_MAX - 1) * sizeof(HistSample));
+    hist[HIST_MAX - 1] = s;
+  }
+  histCompact();
+}
+
+static void drawSpark(int x, int y, int w, int h, bool mem) {
+  tft.fillRoundRect(x, y, w, h, 3, COL_PANEL);
+  tft.drawFastHLine(x + 2, y + h / 2, w - 4, COL_BARBG);
+  if (histCount < 2) return;
+
+  uint32_t t1 = nowSec();
+  uint32_t t0 = t1 > HIST_WINDOW_S ? t1 - HIST_WINDOW_S : 0;
+  if (hist[0].sec > t0) t0 = hist[0].sec;
+  uint32_t span = t1 - t0;
+  if (span < 1) span = 1;
+
+  int16_t px = -1, py = -1;
+  uint16_t col = mem ? COL_CYAN : COL_ORANGE;
+  for (uint16_t i = 0; i < histCount; i++) {
+    float v = mem ? hist[i].mem : (hist[i].loadx100 / 100.0f);
+    if (v > 100) v = 100;
+    int sx = x + 2 + (int)((int32_t)(hist[i].sec - t0) * (w - 4) / (int32_t)span);
+    int sy = y + h - 3 - (int)(v * (h - 6) / 100.0f);
+    if (px >= 0) tft.drawLine(px, py, sx, sy, col);
+    px = sx;
+    py = sy;
+  }
+}
 
 uint32_t lastFastPoll = 0;
 uint32_t lastSlowPoll = 0;
@@ -202,123 +296,99 @@ static void splash(const char *line1, const char *line2 = "") {
 static void drawDashboard() {
   tft.fillScreen(COL_BG);
 
-  // header
-  tft.fillRect(0, 0, 240, 36, COL_PANEL);
+  tft.fillRect(0, 0, 240, 30, COL_PANEL);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_ORANGE, COL_PANEL);
-  tft.drawString("UNRAID", 8, 4, 2);
-  tft.setTextColor(COL_TEXT, COL_PANEL);
-  if (WiFi.isConnected())
-    tft.drawString(WiFi.localIP().toString(), 8, 20, 1);
-  else
-    tft.drawString(st.hostname, 8, 20, 1);
-
+  tft.drawString(st.hostname[0] ? st.hostname : "UNRAID", 6, 2, 2);
+  tft.setTextColor(COL_DIM, COL_PANEL);
+  if (WiFi.isConnected()) tft.drawString(WiFi.localIP().toString(), 6, 18, 1);
   tft.setTextDatum(TR_DATUM);
   tft.setTextColor(st.lastOk ? COL_GREEN : COL_RED, COL_PANEL);
-  tft.drawString(st.lastOk ? "LIVE" : "WAIT", 232, 6, 2);
+  tft.drawString(st.lastOk ? "LIVE" : "WAIT", 234, 2, 2);
   tft.setTextColor(COL_DIM, COL_PANEL);
-  tft.drawString(ago(st.lastOkMs), 232, 22, 1);
+  {
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%s  %up", ago(st.lastOkMs).c_str(), histCount);
+    tft.drawString(buf, 234, 18, 1);
+  }
 
-  int y = 46;
-
-  // CPU / load — UnraidClaw exposes loadavg, not %busy.
-  // Normalise 1m load against thread count when we have it.
-  float cpuPct = -1;
+  float cpuPct = 0;
   if (st.threads > 0) cpuPct = (st.load1 / (float)st.threads) * 100.0f;
   else if (st.haveMetrics) cpuPct = min(st.load1 * 25.0f, 100.0f);
 
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_DIM, COL_BG);
-  tft.drawString("CPU LOAD", 10, y, 1);
+  tft.drawString("CPU", 8, 34, 1);
   tft.setTextDatum(TR_DATUM);
   tft.setTextColor(COL_TEXT, COL_BG);
   {
-    char buf[24];
-    snprintf(buf, sizeof(buf), "1m %.2f", st.load1);
-    tft.drawString(buf, 230, y, 1);
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%.2f  5m %.2f  15m %.2f", st.load1, st.load5, st.load15);
+    tft.drawString(buf, 232, 34, 1);
   }
-  y += 12;
-  drawBar(10, y, 220, 12, cpuPct < 0 ? 0 : cpuPct, heat(cpuPct));
-  y += 16;
+  drawBar(8, 46, 224, 7, cpuPct, heat(cpuPct));
+  drawSpark(8, 56, 224, 48, false);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_DIM, COL_BG);
-  {
-    char buf[48];
-    if (st.threads)
-      snprintf(buf, sizeof(buf), "5m %.2f   15m %.2f   %dT", st.load5, st.load15, st.threads);
-    else
-      snprintf(buf, sizeof(buf), "5m %.2f   15m %.2f", st.load5, st.load15);
-    tft.drawString(buf, 10, y, 1);
+  tft.drawString("2h  5s->1m->3m", 8, 106, 1);
+  if (st.threads) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%dT", st.threads);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(buf, 232, 106, 1);
   }
-  y += 16;
 
-  // Memory
+  tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_DIM, COL_BG);
-  tft.drawString("MEMORY", 10, y, 1);
+  tft.drawString("MEM", 8, 118, 1);
   tft.setTextDatum(TR_DATUM);
   tft.setTextColor(COL_TEXT, COL_BG);
   {
-    char buf[24];
-    snprintf(buf, sizeof(buf), "%.0f%%", st.memUsedPct);
-    tft.drawString(buf, 230, y, 1);
+    String line = String(st.memUsedPct, 0) + "%  " + fmtBytes(st.memUsed) + "/" + fmtBytes(st.memTotal);
+    tft.drawString(line, 232, 118, 1);
   }
-  y += 12;
-  drawBar(10, y, 220, 12, st.memUsedPct, heat(st.memUsedPct));
-  y += 16;
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(COL_DIM, COL_BG);
-  {
-    String line = fmtBytes(st.memUsed) + " / " + fmtBytes(st.memTotal);
-    tft.drawString(line, 10, y, 1);
-  }
-  y += 16;
+  drawBar(8, 130, 224, 7, st.memUsedPct, heat(st.memUsedPct));
+  drawSpark(8, 140, 224, 40, true);
 
-  // Array
-  tft.setTextColor(COL_DIM, COL_BG);
-  tft.drawString("ARRAY", 10, y, 1);
-  tft.setTextDatum(TR_DATUM);
   uint16_t stateCol = COL_DIM;
   if (!strcasecmp(st.arrayState, "STARTED") || !strcasecmp(st.arrayState, "START"))
     stateCol = COL_GREEN;
   else if (st.arrayState[0] && strcmp(st.arrayState, "-"))
     stateCol = COL_YELLOW;
-  tft.setTextColor(stateCol, COL_BG);
-  tft.drawString(st.arrayState, 230, y, 1);
-  y += 12;
-  float ap = st.arrayUsedPct < 0 ? 0 : st.arrayUsedPct;
-  drawBar(10, y, 220, 12, ap, heat(ap));
-  y += 16;
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_DIM, COL_BG);
+  tft.drawString("ARY", 8, 184, 1);
+  tft.setTextColor(stateCol, COL_BG);
+  tft.drawString(st.arrayState, 36, 184, 1);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(COL_TEXT, COL_BG);
   if (st.arrayTotalKB > 0) {
-    String line = fmtKB(st.arrayUsedKB) + " / " + fmtKB(st.arrayTotalKB);
-    if (st.arrayUsedPct >= 0) line += "  " + String(st.arrayUsedPct, 0) + "%";
-    tft.drawString(line, 10, y, 1);
-  } else {
-    tft.drawString("waiting for array data", 10, y, 1);
+    String line = fmtKB(st.arrayUsedKB) + "/" + fmtKB(st.arrayTotalKB);
+    if (st.arrayUsedPct >= 0) line += " " + String(st.arrayUsedPct, 0) + "%";
+    tft.drawString(line, 232, 184, 1);
   }
-  y += 20;
+  float ap = st.arrayUsedPct < 0 ? 0 : st.arrayUsedPct;
+  drawBar(8, 196, 224, 7, ap, heat(ap));
 
-  // Docker + VM tiles
   auto tile = [](int x, const char *title, int run, int tot, uint16_t accent) {
-    tft.fillRoundRect(x, 196, 108, 38, 6, COL_PANEL);
+    tft.fillRoundRect(x, 208, 110, 28, 4, COL_PANEL);
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(accent, COL_PANEL);
-    tft.drawString(title, x + 8, 200, 1);
+    tft.drawString(title, x + 6, 212, 1);
     tft.setTextColor(COL_TEXT, COL_PANEL);
     char buf[20];
     if (run < 0) snprintf(buf, sizeof(buf), "--");
     else if (tot < 0) snprintf(buf, sizeof(buf), "%d", run);
-    else snprintf(buf, sizeof(buf), "%d / %d", run, tot);
-    tft.drawString(buf, x + 8, 214, 2);
+    else snprintf(buf, sizeof(buf), "%d/%d", run, tot);
+    tft.drawString(buf, x + 6, 222, 1);
   };
   tile(8, "DOCKER", st.dockerRunning, st.dockerTotal, COL_CYAN);
-  tile(124, "VMS", st.vmsRunning, st.vmsTotal, COL_ORANGE);
+  tile(122, "VMS", st.vmsRunning, st.vmsTotal, COL_ORANGE);
 
   if (!st.lastOk) {
     tft.setTextDatum(BC_DATUM);
     tft.setTextColor(COL_RED, COL_BG);
-    tft.drawString(st.lastError, 120, 192, 1);
+    tft.drawString(st.lastError, 120, 206, 1);
   }
 }
 
@@ -399,6 +469,7 @@ static void pollMetrics() {
     st.load15 = data["cpuLoad"]["load15m"] | 0.0f;
   }
   st.haveMetrics = true;
+  histPush();
 }
 
 static void pollInfo() {
