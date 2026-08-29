@@ -85,6 +85,17 @@ struct HistSample {
 static HistSample hist[HIST_MAX];
 static uint16_t histCount = 0;
 
+static const uint16_t COL_BG     = 0x10A2;
+static const uint16_t COL_PANEL  = 0x2124;
+static const uint16_t COL_ORANGE = 0xFD20;
+static const uint16_t COL_TEXT   = 0xEF7D;
+static const uint16_t COL_DIM    = 0x8410;
+static const uint16_t COL_GREEN  = 0x07E0;
+static const uint16_t COL_RED    = 0xF800;
+static const uint16_t COL_YELLOW = 0xFFE0;
+static const uint16_t COL_BARBG  = 0x3186;
+static const uint16_t COL_CYAN   = 0x07FF;
+
 static uint32_t nowSec() { return millis() / 1000UL; }
 
 static uint32_t histGap(uint32_t age) {
@@ -171,18 +182,6 @@ static void drawSpark(int x, int y, int w, int h, bool mem) {
 uint32_t lastFastPoll = 0;
 uint32_t lastSlowPoll = 0;
 bool portalActive = false;
-
-// Unraid orange + dark chrome
-static const uint16_t COL_BG     = 0x10A2; // ~#111318
-static const uint16_t COL_PANEL  = 0x2124;
-static const uint16_t COL_ORANGE = 0xFD20; // #FF8C00-ish
-static const uint16_t COL_TEXT   = 0xEF7D;
-static const uint16_t COL_DIM    = 0x8410;
-static const uint16_t COL_GREEN  = 0x07E0;
-static const uint16_t COL_RED    = 0xF800;
-static const uint16_t COL_YELLOW = 0xFFE0;
-static const uint16_t COL_BARBG  = 0x3186;
-static const uint16_t COL_CYAN   = 0x07FF;
 
 static void setBacklight(uint8_t bri) {
 #ifdef TFT_BL
