@@ -46,6 +46,8 @@ struct Settings {
   bool useHttps;
   bool insecureTls;
   char apiKey[MAX_KEY_LEN];
+  char ssid[MAX_SSID_LEN];
+  char pass[MAX_PASS_LEN];
   uint16_t pollMs;
   uint8_t brightness;
   bool invertBl;
@@ -209,6 +211,7 @@ static void drawSpark(int x, int y, int w, int h, bool mem) {
 uint32_t lastFastPoll = 0;
 uint32_t lastSlowPoll = 0;
 bool portalActive = false;
+static bool otaRunning = false;
 
 static void setBacklight(uint8_t bri) {
 #ifdef TFT_BL
@@ -249,6 +252,8 @@ static void loadSettings() {
     cfg.useHttps = doc["https"] | DEFAULT_HTTPS;
     cfg.insecureTls = doc["insecure"] | DEFAULT_INSECURE_TLS;
     strlcpy(cfg.apiKey, doc["key"] | "", MAX_KEY_LEN);
+    strlcpy(cfg.ssid, doc["ssid"] | "", MAX_SSID_LEN);
+    strlcpy(cfg.pass, doc["pass"] | "", MAX_PASS_LEN);
     cfg.pollMs = doc["poll"] | DEFAULT_POLL_MS;
     cfg.brightness = doc["bri"] | DEFAULT_BRIGHTNESS;
     cfg.invertBl = doc["invbl"] | true;
@@ -285,6 +290,8 @@ static void saveSettings() {
   doc["https"] = cfg.useHttps;
   doc["insecure"] = cfg.insecureTls;
   doc["key"] = cfg.apiKey;
+  doc["ssid"] = cfg.ssid;
+  doc["pass"] = cfg.pass;
   doc["poll"] = cfg.pollMs;
   doc["bri"] = cfg.brightness;
   doc["invbl"] = cfg.invertBl;
@@ -646,6 +653,10 @@ button.secondary{background:#333;color:#eee}
 <p class=status>Device IP %IP%<br>Unraid target: %HOSTSHOW%:%PORT%<br>Last poll: %STATUS%<br>Last URL: %LASTURL%<br>HTTP code: %HTTPCODE%<br>Free heap: %HEAP%</p>
 <p><a href="/logs">Logs</a> &nbsp; <a href="/update">Firmware update</a> &nbsp; <a href="/status">Status JSON</a></p>
 <form method=POST action=/save>
+<label>Wi-Fi SSID (2.4 GHz)</label>
+<input name=ssid value="%SSID%" placeholder="home wifi" autocomplete="off">
+<label>Wi-Fi password</label>
+<input name=pass type=password value="%WIFIPASS%" autocomplete="off">
 <label>Unraid IP or hostname</label>
 <input name=host value="%HOST%" placeholder="192.168.1.10" autocomplete="off">
 <label>UnraidClaw port</label>
@@ -682,7 +693,9 @@ static String htmlEscape(const String &s) {
 
 static void handleRoot() {
   String page = FPSTR(PAGE);
-  page.replace("%IP%", WiFi.localIP().toString());
+  page.replace("%IP%", WiFi.isConnected() ? WiFi.localIP().toString() : WiFi.softAPIP().toString());
+  page.replace("%SSID%", htmlEscape(cfg.ssid));
+  page.replace("%WIFIPASS%", htmlEscape(cfg.pass));
   page.replace("%HOSTSHOW%", cfg.host[0] ? htmlEscape(cfg.host) : String("(not set)"));
   page.replace("%STATUS%", st.lastOk ? String("ok") : htmlEscape(st.lastError));
   page.replace("%HOST%", htmlEscape(cfg.host));
@@ -711,6 +724,8 @@ static void handleSave() {
   cfg.useHttps = server.arg("https") != "0";
   cfg.insecureTls = server.arg("insecure") != "0";
   strlcpy(cfg.apiKey, server.arg("key").c_str(), MAX_KEY_LEN);
+  strlcpy(cfg.ssid, server.arg("ssid").c_str(), MAX_SSID_LEN);
+  strlcpy(cfg.pass, server.arg("pass").c_str(), MAX_PASS_LEN);
   cfg.pollMs = server.arg("poll").toInt();
   if (cfg.pollMs < 2000) cfg.pollMs = 2000;
   cfg.brightness = constrain(server.arg("bri").toInt(), 0, 255);
@@ -771,6 +786,7 @@ static void handleUpdateDone() {
 static void handleUpdateUpload() {
   HTTPUpload &upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
+    otaRunning = true;
     splash("updating", upload.filename.c_str());
     Serial.printf("OTA start: %s\n", upload.filename.c_str());
 #ifdef ESP32
@@ -895,7 +911,8 @@ static bool connectSavedWifi() {
   WiFi.mode(WIFI_STA);
   delay(100);
   ESP.wdtFeed();
-  WiFi.begin();
+  if (cfg.ssid[0]) WiFi.begin(cfg.ssid, cfg.pass);
+  else WiFi.begin();
   splash("WiFi", "connecting");
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 12000UL) {
@@ -950,7 +967,7 @@ void loop() {
   MDNS.update();
 #endif
 
-  if (wantPortal) {
+  if (wantPortal && !otaRunning) {
     wantPortal = false;
     runWifiPortal(true);
     splash(WiFi.localIP().toString().c_str(), "open IP for Settings");
@@ -958,12 +975,12 @@ void loop() {
   }
 
   uint32_t now = millis();
-  if (cfg.host[0] && cfg.apiKey[0] && now - lastFastPoll >= cfg.pollMs) {
+  if (!otaRunning && cfg.host[0] && cfg.apiKey[0] && now - lastFastPoll >= cfg.pollMs) {
     lastFastPoll = now;
     pollMetrics();
     drawDashboard();
   }
-  if (cfg.host[0] && cfg.apiKey[0] && now - lastSlowPoll >= DEFAULT_SLOW_POLL_MS) {
+  if (!otaRunning && cfg.host[0] && cfg.apiKey[0] && now - lastSlowPoll >= DEFAULT_SLOW_POLL_MS) {
     lastSlowPoll = now;
     static uint8_t slowStep = 0;
     switch (slowStep++ & 3) {

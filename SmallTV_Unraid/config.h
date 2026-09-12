@@ -1,7 +1,7 @@
 #pragma once
 
 #define FW_NAME    "smalltv-unraidclaw"
-#define FW_VERSION "1.3.2"
+#define FW_VERSION "1.3.3"
 
 #define AP_SSID    "SmallTV-Unraid"
 #define AP_PASS    ""
@@ -16,6 +16,8 @@
 #define SETTINGS_PATH "/settings.json"
 #define MAX_HOST_LEN  80
 #define MAX_KEY_LEN   128
+#define MAX_SSID_LEN  33
+#define MAX_PASS_LEN  65
 #define LOG_LINES     24
 #define LOG_LINE_LEN  96
 
