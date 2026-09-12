@@ -7,6 +7,7 @@
 // array, docker and VM counts on the 240x240 ST7789.
 
 #include <Arduino.h>
+#include <stdarg.h>
 #include <string.h>
 #include <TFT_eSPI.h>
 #include <ArduinoJson.h>
@@ -86,6 +87,28 @@ struct HistSample {
 
 static HistSample hist[HIST_MAX];
 static uint16_t histCount = 0;
+
+static char logBuf[LOG_LINES][LOG_LINE_LEN];
+static uint8_t logHead = 0;
+static uint8_t logCount = 0;
+static char lastUrl[160] = "";
+static int lastHttpCode = 0;
+
+static void appLog(const char *msg) {
+  Serial.println(msg);
+  strlcpy(logBuf[logHead], msg, LOG_LINE_LEN);
+  logHead = (logHead + 1) % LOG_LINES;
+  if (logCount < LOG_LINES) logCount++;
+}
+
+static void appLogf(const char *fmt, ...) {
+  char tmp[LOG_LINE_LEN];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(tmp, sizeof(tmp), fmt, ap);
+  va_end(ap);
+  appLog(tmp);
+}
 
 static const uint16_t COL_BG     = 0x10A2;
 static const uint16_t COL_PANEL  = 0x2124;
@@ -229,6 +252,28 @@ static void loadSettings() {
     cfg.invertBl = doc["invbl"] | true;
   }
   f.close();
+}
+
+static void sanitizeHost() {
+  String s = cfg.host;
+  s.trim();
+  if (s.startsWith("https://")) s.remove(0, 8);
+  if (s.startsWith("http://")) s.remove(0, 7);
+  int slash = s.indexOf('/');
+  if (slash >= 0) s = s.substring(0, slash);
+  int colon = s.lastIndexOf(':');
+  if (colon > 0) {
+    bool looksPort = true;
+    for (int i = colon + 1; i < (int)s.length(); i++) {
+      if (!isDigit(s[i])) { looksPort = false; break; }
+    }
+    if (looksPort && s.length() > colon + 1) {
+      int p = s.substring(colon + 1).toInt();
+      if (p > 0 && p < 65536) cfg.port = (uint16_t)p;
+      s = s.substring(0, colon);
+    }
+  }
+  strlcpy(cfg.host, s.c_str(), MAX_HOST_LEN);
 }
 
 static void saveSettings() {
@@ -396,9 +441,13 @@ static void drawDashboard() {
 
 // ---- HTTP helpers ---------------------------------------------------------
 static bool httpGet(const char *path, JsonDocument &doc) {
+#ifdef ESP8266
+  ESP.wdtFeed();
+#endif
   if (!cfg.host[0] || !cfg.apiKey[0]) {
     strlcpy(st.lastError, "set host + API key", sizeof(st.lastError));
     st.lastOk = false;
+    appLog(st.lastError);
     return false;
   }
 
@@ -406,6 +455,7 @@ static bool httpGet(const char *path, JsonDocument &doc) {
   snprintf(url, sizeof(url), "%s://%s:%u%s",
            cfg.useHttps ? "https" : "http",
            cfg.host, (unsigned)cfg.port, path);
+  strlcpy(lastUrl, url, sizeof(lastUrl));
 
   WiFiClientSecure secure;
   WiFiClient plain;
@@ -413,27 +463,36 @@ static bool httpGet(const char *path, JsonDocument &doc) {
   if (cfg.insecureTls) secure.setInsecure();
 #else
   secure.setInsecure();
-  secure.setBufferSizes(1024, 512);
+  // 1024/512 is too small for UnraidClaw's TLS handshake → HTTP -1
+  secure.setBufferSizes(2048, 512);
 #endif
 
   HTTPClient http;
-  http.setTimeout(8000);
+  http.setTimeout(6000);
   http.setReuse(false);
-  bool okBegin;
-  if (cfg.useHttps) okBegin = http.begin(secure, url);
-  else okBegin = http.begin(plain, url);
+  bool okBegin = cfg.useHttps ? http.begin(secure, url) : http.begin(plain, url);
   if (!okBegin) {
     strlcpy(st.lastError, "http begin fail", sizeof(st.lastError));
     st.lastOk = false;
+    appLogf("begin fail %s", url);
     return false;
   }
   http.addHeader("x-api-key", cfg.apiKey);
+  http.addHeader("Authorization", String("Bearer ") + cfg.apiKey);
   http.addHeader("Accept", "application/json");
 
+#ifdef ESP8266
+  ESP.wdtFeed();
+#endif
   int code = http.GET();
+  lastHttpCode = code;
+#ifdef ESP8266
+  ESP.wdtFeed();
+#endif
   if (code != 200) {
     snprintf(st.lastError, sizeof(st.lastError), "HTTP %d %s", code, path);
     st.lastOk = false;
+    appLogf("%s -> %d heap=%u", path, code, (unsigned)ESP.getFreeHeap());
     http.end();
     return false;
   }
@@ -443,16 +502,19 @@ static bool httpGet(const char *path, JsonDocument &doc) {
   if (err) {
     snprintf(st.lastError, sizeof(st.lastError), "json %s", err.c_str());
     st.lastOk = false;
+    appLogf("json %s %s", err.c_str(), path);
     return false;
   }
-  if (doc["ok"] != true) {
+  if (doc["ok"] != true && !doc["data"].is<JsonObject>() && !doc["data"].is<JsonArray>()) {
     strlcpy(st.lastError, "api ok=false", sizeof(st.lastError));
     st.lastOk = false;
+    appLog("api ok=false");
     return false;
   }
   st.lastOk = true;
   st.lastOkMs = millis();
   st.lastError[0] = 0;
+  appLogf("ok %s", path);
   return true;
 }
 
@@ -576,7 +638,8 @@ button.secondary{background:#333;color:#eee}
 .status{background:#1b1e26;padding:10px;border-radius:6px;font-size:13px}
 </style></head><body>
 <h2>Settings</h2>
-<p class=status>Device IP %IP%<br>Unraid target: %HOSTSHOW%<br>Last poll: %STATUS%</p>
+<p class=status>Device IP %IP%<br>Unraid target: %HOSTSHOW%:%PORT%<br>Last poll: %STATUS%<br>Last URL: %LASTURL%<br>HTTP code: %HTTPCODE%<br>Free heap: %HEAP%</p>
+<p><a href="/logs">Logs</a> &nbsp; <a href="/update">Firmware update</a> &nbsp; <a href="/status">Status JSON</a></p>
 <form method=POST action=/save>
 <label>Unraid IP or hostname</label>
 <input name=host value="%HOST%" placeholder="192.168.1.10" autocomplete="off">
@@ -629,11 +692,15 @@ static void handleRoot() {
   page.replace("%B1%", cfg.invertBl ? "selected" : "");
   page.replace("%B0%", cfg.invertBl ? "" : "selected");
   page.replace("%FW%", FW_VERSION);
+  page.replace("%LASTURL%", htmlEscape(lastUrl));
+  page.replace("%HTTPCODE%", String(lastHttpCode));
+  page.replace("%HEAP%", String(ESP.getFreeHeap()));
   server.send(200, "text/html", page);
 }
 
 static void handleSave() {
   strlcpy(cfg.host, server.arg("host").c_str(), MAX_HOST_LEN);
+  sanitizeHost();
   cfg.port = server.arg("port").toInt();
   if (!cfg.port) cfg.port = DEFAULT_PORT;
   cfg.useHttps = server.arg("https") != "0";
@@ -721,6 +788,30 @@ static void startWeb() {
   server.on("/save", HTTP_POST, handleSave);
   server.on("/update", HTTP_GET, handleUpdatePage);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
+  server.on("/logs", HTTP_GET, []() {
+    String page;
+    page.reserve(1800);
+    page += F("<!DOCTYPE html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
+              "<meta http-equiv=refresh content=5>"
+              "<title>SmallTV logs</title>"
+              "<style>body{font-family:monospace;background:#111;color:#9f9;margin:16px}"
+              "a{color:#ff8c2f}</style></head><body>");
+    page += F("<p><a href='/'>Settings</a> &nbsp; <a href='/update'>Update</a></p><pre>");
+    int n = logCount;
+    int start = (logHead + LOG_LINES - n) % LOG_LINES;
+    for (int i = 0; i < n; i++) {
+      page += logBuf[(start + i) % LOG_LINES];
+      page += '\n';
+    }
+    page += F("</pre><p>Last URL: ");
+    page += htmlEscape(lastUrl);
+    page += F("<br>HTTP ");
+    page += String(lastHttpCode);
+    page += F("<br>heap ");
+    page += String(ESP.getFreeHeap());
+    page += F("</p></body></html>");
+    server.send(200, "text/html", page);
+  });
   server.on("/portal", HTTP_POST, []() {
     wantPortal = true;
     server.send(200, "text/html",
@@ -749,6 +840,7 @@ static void applyPortalParams(WiFiManagerParameter &p_host,
                               WiFiManagerParameter &p_https) {
   const char *h = p_host.getValue();
   if (h && h[0]) strlcpy(cfg.host, h, MAX_HOST_LEN);
+  sanitizeHost();
   int port = atoi(p_port.getValue());
   if (port > 0) cfg.port = (uint16_t)port;
   const char *k = p_key.getValue();
@@ -813,13 +905,11 @@ void setup() {
   MDNS.begin("smalltv-unraid");
   startWeb();
 
-  if (cfg.host[0] && cfg.apiKey[0]) {
-    pollInfo();
-    pollMetrics();
-    pollArray();
-    pollDocker();
-    pollVms();
-  }
+  appLogf("boot %s heap=%u", WiFi.localIP().toString().c_str(),
+          (unsigned)ESP.getFreeHeap());
+  appLogf("target %s:%u tls=%d", cfg.host, cfg.port, cfg.useHttps);
+  // One request only — five TLS handshakes here used to trip the WDT.
+  if (cfg.host[0] && cfg.apiKey[0]) pollMetrics();
   drawDashboard();
   lastFastPoll = millis();
   lastSlowPoll = millis();
