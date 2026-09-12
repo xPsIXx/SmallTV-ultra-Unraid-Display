@@ -36,6 +36,8 @@
 
 TFT_eSPI tft;
 HttpServer server(80);
+WiFiClientSecure tlsClient;
+WiFiClient plainClient;
 
 // ---- persisted settings ---------------------------------------------------
 struct Settings {
@@ -457,20 +459,23 @@ static bool httpGet(const char *path, JsonDocument &doc) {
            cfg.host, (unsigned)cfg.port, path);
   strlcpy(lastUrl, url, sizeof(lastUrl));
 
-  WiFiClientSecure secure;
-  WiFiClient plain;
 #ifdef ESP32
-  if (cfg.insecureTls) secure.setInsecure();
+  if (cfg.insecureTls) tlsClient.setInsecure();
 #else
-  secure.setInsecure();
-  // 1024/512 is too small for UnraidClaw's TLS handshake → HTTP -1
-  secure.setBufferSizes(2048, 512);
+  tlsClient.setInsecure();
+  tlsClient.setBufferSizes(1536, 512);
 #endif
 
+  if (ESP.getFreeHeap() < 10000) {
+    strlcpy(st.lastError, "low heap, skip http", sizeof(st.lastError));
+    appLogf("skip http heap=%u", (unsigned)ESP.getFreeHeap());
+    return false;
+  }
+
   HTTPClient http;
-  http.setTimeout(6000);
+  http.setTimeout(3000);
   http.setReuse(false);
-  bool okBegin = cfg.useHttps ? http.begin(secure, url) : http.begin(plain, url);
+  bool okBegin = cfg.useHttps ? http.begin(tlsClient, url) : http.begin(plainClient, url);
   if (!okBegin) {
     strlcpy(st.lastError, "http begin fail", sizeof(st.lastError));
     st.lastOk = false;
@@ -908,8 +913,7 @@ void setup() {
   appLogf("boot %s heap=%u", WiFi.localIP().toString().c_str(),
           (unsigned)ESP.getFreeHeap());
   appLogf("target %s:%u tls=%d", cfg.host, cfg.port, cfg.useHttps);
-  // One request only — five TLS handshakes here used to trip the WDT.
-  if (cfg.host[0] && cfg.apiKey[0]) pollMetrics();
+  // Do not call UnraidClaw during setup() — TLS + WDT is how the last boot loop started.
   drawDashboard();
   lastFastPoll = millis();
   lastSlowPoll = millis();
@@ -936,10 +940,13 @@ void loop() {
   }
   if (cfg.host[0] && cfg.apiKey[0] && now - lastSlowPoll >= DEFAULT_SLOW_POLL_MS) {
     lastSlowPoll = now;
-    pollInfo();
-    pollArray();
-    pollDocker();
-    pollVms();
+    static uint8_t slowStep = 0;
+    switch (slowStep++ & 3) {
+      case 0: pollInfo(); break;
+      case 1: pollArray(); break;
+      case 2: pollDocker(); break;
+      default: pollVms(); break;
+    }
     drawDashboard();
   }
 }
