@@ -212,6 +212,7 @@ uint32_t lastFastPoll = 0;
 uint32_t lastSlowPoll = 0;
 bool portalActive = false;
 static bool otaRunning = false;
+static bool apUp = false;
 
 static void setBacklight(uint8_t bri) {
 #ifdef TFT_BL
@@ -734,10 +735,16 @@ static void handleSave() {
   setBacklight(cfg.brightness);
   lastFastPoll = 0;
   lastSlowPoll = 0;
+  if (cfg.ssid[0]) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(cfg.ssid, cfg.pass);
+    appLogf("wifi begin %s", cfg.ssid);
+  }
   server.send(200, "text/html",
-              "<meta http-equiv=refresh content='2;url=/'>"
+              "<meta http-equiv=refresh content='5;url=/'>"
               "<body style='background:#111;color:#eee;font-family:sans-serif'>"
-              "Saved. Polling UnraidClaw&hellip;</body>");
+              "Saved. Connecting Wi-Fi if you entered an SSID. "
+              "If the page drops, join SmallTV-Unraid or the LAN IP on the screen.</body>");
 }
 
 static const char UPDATE_PAGE[] PROGMEM = R"HTML(
@@ -925,6 +932,7 @@ static bool connectSavedWifi() {
 static void startFallbackAp() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID);
+  apUp = true;
   delay(100);
   splash("192.168.4.1", "join SmallTV-Unraid");
   appLog("fallback AP 192.168.4.1");
@@ -967,6 +975,15 @@ void loop() {
   MDNS.update();
 #endif
 
+  uint32_t now = millis();
+  static uint32_t lostMs = 0;
+  if (WiFi.isConnected()) {
+    lostMs = 0;
+  } else if (!otaRunning) {
+    if (!lostMs) lostMs = now;
+    if (now - lostMs > 15000UL && !apUp) startFallbackAp();
+  }
+
   if (wantPortal && !otaRunning) {
     wantPortal = false;
     runWifiPortal(true);
@@ -974,7 +991,6 @@ void loop() {
     drawDashboard();
   }
 
-  uint32_t now = millis();
   if (!otaRunning && cfg.host[0] && cfg.apiKey[0] && now - lastFastPoll >= cfg.pollMs) {
     lastFastPoll = now;
     pollMetrics();
