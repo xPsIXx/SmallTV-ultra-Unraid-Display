@@ -867,9 +867,9 @@ static void runWifiPortal(bool force) {
   ESP.wdtFeed();
 
   WiFiManager wm;
-  wm.setDebugOutput(true);
-  wm.setConfigPortalTimeout(0);   // stay up until saved — timeout was rebooting people
-  wm.setConnectTimeout(20);
+  wm.setDebugOutput(false);
+  wm.setConfigPortalTimeout(180);
+  wm.setConnectTimeout(15);
   wm.setHostname("smalltv-unraid");
   wm.setHttpPort(80);
 
@@ -888,6 +888,31 @@ static void runWifiPortal(bool force) {
   if (ok) applyPortalParams(p_host, p_port, p_key, p_https);
 }
 
+static bool connectSavedWifi() {
+  WiFi.persistent(true);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.hostname("smalltv-unraid");
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  ESP.wdtFeed();
+  WiFi.begin();
+  splash("WiFi", "connecting");
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 12000UL) {
+    delay(200);
+    ESP.wdtFeed();
+  }
+  return WiFi.isConnected();
+}
+
+static void startFallbackAp() {
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID);
+  delay(100);
+  splash("192.168.4.1", "join SmallTV-Unraid");
+  appLog("fallback AP 192.168.4.1");
+}
+
 void setup() {
   Serial.begin(115200);
   delay(50);
@@ -903,17 +928,17 @@ void setup() {
   loadSettings();
   setBacklight(cfg.brightness);
 
-  WiFi.mode(WIFI_STA);
-  runWifiPortal(false);
+  // Always reach startWeb(). Do not run WiFiManager during boot.
+  if (!connectSavedWifi()) startFallbackAp();
+  else splash(WiFi.localIP().toString().c_str(), "open IP for Settings");
 
-  splash(WiFi.localIP().toString().c_str(), "open IP for Settings");
   MDNS.begin("smalltv-unraid");
   startWeb();
 
-  appLogf("boot %s heap=%u", WiFi.localIP().toString().c_str(),
+  appLogf("boot %s heap=%u",
+          WiFi.isConnected() ? WiFi.localIP().toString().c_str() : "192.168.4.1",
           (unsigned)ESP.getFreeHeap());
   appLogf("target %s:%u tls=%d", cfg.host, cfg.port, cfg.useHttps);
-  // Do not call UnraidClaw during setup() — TLS + WDT is how the last boot loop started.
   drawDashboard();
   lastFastPoll = millis();
   lastSlowPoll = millis();
